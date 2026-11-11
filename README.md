@@ -62,7 +62,21 @@ spec:
 
 The controller validates that interface pair in the referenced YAML and starts the DaemonSet with `--af-packet --runmode workers`. Supply Suricata rules containing the intended `drop` actions through the Suricata configuration or `rulesFileRef`/`rulesFileRefs`. Configure the node network so the dedicated interfaces really carry the intended traffic. Apply a node selector suitable for your topology; without one, the DaemonSet targets all Linux nodes. The image must support AF_PACKET IPS and the cluster must permit NET_RAW and NET_ADMIN.
 
-**Inline mode changes the forwarding path and may interrupt traffic**, including when configuration, interfaces, rules, the process, a pod, or a node fail. This operator does not install an automatic hardware bypass or fail-safe path. The controller checks the paired interfaces and IPS copy mode when reconciling; it does not validate the complete Suricata configuration, rules, or network topology. Test on an isolated link before any production use. This feature uses Suricata's native AF_PACKET IPS; it does not implement eBPF/XDP enforcement. See [bounded verification](docs/live-verification.md).
+**Inline mode changes the forwarding path and may interrupt traffic**, including when configuration, interfaces, rules, the process, a pod, or a node fail. This operator does not install an automatic hardware bypass or fail-safe path. The controller checks the paired interfaces and IPS copy mode when reconciling; it does not validate the complete Suricata configuration, rules, or network topology. Test on an isolated link before any production use. This inline forwarding mode uses Suricata's native AF_PACKET IPS. An optional XDP verdict cache is described below. See [bounded verification](docs/live-verification.md).
+
+## Optional XDP verdict cache
+
+For an explicitly configured inline IPS sensor, an experimental sidecar can cache observed blocked EVE alert tuples in a node-local XDP map. Build the sidecar for the cluster architecture and make it available to the node:
+
+```sh
+docker build -f Dockerfile.xdp -t YOUR_REGISTRY/yas-xdp-verdict:dev .
+```
+
+Add `xdpVerdictCache: {image: YOUR_REGISTRY/yas-xdp-verdict:dev, ttlSeconds: 30}` under `spec.capture` alongside `inlineInterfaces` and `hostNetwork: true`. TTL must be 1–300 seconds. The referenced Suricata YAML must set `default-log-dir: /var/log/suricata` and enable an unthreaded regular EVE log named `eve.json` with alert events. The operator mounts a shared, pod-local log volume for Suricata and the sidecar. An optional `fileExtraction` PVC can be mounted under the log directory separately. The sidecar needs Linux `CAP_BPF`, `CAP_PERFMON`, and `CAP_NET_ADMIN`, plus an unconfined seccomp profile; the cluster must permit these privileges. It does not intentionally replace an existing XDP attachment; an attachment conflict causes it to exit.
+
+Only **newly observed** Suricata alert events with `alert.action: blocked` are cached. The cache attaches to the **first** inline interface and matches the observed forward IPv4 TCP or UDP five-tuple. IPv6, VLAN-tagged, fragmented, other-protocol and reverse-direction traffic pass through to Suricata. The cache holds at most 4,096 entries and uses an LRU map; expiry, eviction, missed or delayed EVE events and sidecar failure pass traffic to the existing Suricata IPS path, not a fail-closed XDP path. A reused five-tuple can be dropped until its entry expires, even when a later packet would not match the original rule. Limit TTL to the operational need. On startup the sidecar skips existing log content to avoid replaying stale verdicts; it follows new files and observed truncation, but log loss or a truncate-and-regrow between polls can miss events. This cache makes no guarantee that every blocked flow reaches XDP. It adds no network bypass or failure protection.
+
+The XDP source is `cmd/xdp-verdict/bpf/xdp.c` (Apache 2.0); the embedded `xdp.o` was compiled using Homebrew clang 23.1.3 with `clang -target bpfel -O2 -g -fdebug-prefix-map="$PWD"=. -c cmd/xdp-verdict/bpf/xdp.c -o cmd/xdp-verdict/bpf/xdp.o`. Rebuilding with the same toolchain and command reproduced SHA-256 `75174fcf6ce14ab261ddebc457cea80a9c230d9cea4d0cfacfaae816a4a118e9`. The little-endian object and tested sidecar target Linux arm64/amd64; kernel support and permissions still need to be available.
 
 ## File extraction storage
 
@@ -95,7 +109,7 @@ The controller exposes the sidecar through a per-sensor Service. Setting `servic
 
 ## Try it
 
-Requirements: Go 1.21+, Docker (or another image builder), `kubectl`, a Kubernetes cluster, and a compatible Suricata image. The cluster needs an existing PVC with an `incoming` directory containing PCAP files. A producer must populate that volume; the operator does not create or populate it.
+Requirements: Go 1.22+, Docker (or another image builder), `kubectl`, a Kubernetes cluster, and a compatible Suricata image. The cluster needs an existing PVC with an `incoming` directory containing PCAP files. A producer must populate that volume; the operator does not create or populate it.
 
 1. Build and publish (or load into your cluster) an operator image:
 

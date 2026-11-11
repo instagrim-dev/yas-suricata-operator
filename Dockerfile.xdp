@@ -1,0 +1,11 @@
+FROM golang:1.23 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/xdp-verdict ./cmd/xdp-verdict
+COPY internal/xdpverdict ./internal/xdpverdict
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /xdp-verdict ./cmd/xdp-verdict
+FROM gcr.io/distroless/static:nonroot
+COPY --from=build /xdp-verdict /xdp-verdict
+USER 0:0
+ENTRYPOINT ["/xdp-verdict"]

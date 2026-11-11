@@ -132,6 +132,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			return ctrl.Result{}, err
 		}
 	}
+	xdpImage, _, _ := unstructured.NestedString(s.Object, "spec", "capture", "xdpVerdictCache", "image")
+	xdpTTL, xdpTTLFound, err := unstructured.NestedInt64(s.Object, "spec", "capture", "xdpVerdictCache", "ttlSeconds")
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if xdpImage != "" || xdpTTLFound {
+		if len(inlineInterfaces) != 2 || xdpImage == "" || !xdpTTLFound || xdpTTL < 1 || xdpTTL > 300 {
+			return ctrl.Result{}, fmt.Errorf("XDP verdict cache requires inline IPS, an image and ttlSeconds between 1 and 300")
+		}
+		cm := &corev1.ConfigMap{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: s.GetNamespace(), Name: configName}, cm); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := validateXDPLogConfig(cm.Data[configKey]); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	fileClaim, _, _ := unstructured.NestedString(s.Object, "spec", "fileExtraction", "claimName")
 	filePath, _, _ := unstructured.NestedString(s.Object, "spec", "fileExtraction", "mountPath")
 	if (fileClaim == "") != (filePath == "") {
@@ -287,6 +304,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		if fileClaim != "" {
 			engine.VolumeMounts = append(engine.VolumeMounts, corev1.VolumeMount{Name: "filestore", MountPath: filePath})
 			pod.Volumes = append(pod.Volumes, corev1.Volume{Name: "filestore", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: fileClaim}}})
+		}
+		if xdpImage != "" {
+			engine.VolumeMounts = append(engine.VolumeMounts, corev1.VolumeMount{Name: "eve-log", MountPath: "/var/log/suricata"})
+			pod.Volumes = append(pod.Volumes, corev1.Volume{Name: "eve-log", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
+			pod.Containers = append(pod.Containers, corev1.Container{Name: "xdp-verdict", Image: xdpImage, Args: []string{"-interface", inlineInterfaces[0], "-eve", "/var/log/suricata/eve.json", "-ttl", fmt.Sprintf("%ds", xdpTTL)}, VolumeMounts: []corev1.VolumeMount{{Name: "eve-log", MountPath: "/var/log/suricata", ReadOnly: true}}, SecurityContext: &corev1.SecurityContext{RunAsUser: ptr(int64(0)), AllowPrivilegeEscalation: ptr(false), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}, Add: []corev1.Capability{"NET_ADMIN", "BPF", "PERFMON"}}, SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeUnconfined}}})
 		}
 		if metricsImage != "" {
 			pod.Containers = append(pod.Containers, corev1.Container{Name: "metrics-exporter", Image: metricsImage, Args: metricsArgs, Ports: []corev1.ContainerPort{{Name: "metrics", ContainerPort: int32(metricsPort)}}})
@@ -586,4 +608,28 @@ func validateInlineConfig(content string, interfaces []string) error {
 		return fmt.Errorf("inline AF_PACKET configuration missing required symmetric interfaces")
 	}
 	return nil
+}
+
+func validateXDPLogConfig(content string) error {
+	var cfg struct {
+		DefaultLogDir string `json:"default-log-dir"`
+		Outputs       []map[string]struct {
+			Enabled  bool   `json:"enabled"`
+			Filetype string `json:"filetype"`
+			Filename string `json:"filename"`
+			Threaded bool   `json:"threaded"`
+		} `json:"outputs"`
+	}
+	if err := yaml.Unmarshal([]byte(content), &cfg); err != nil {
+		return fmt.Errorf("invalid Suricata log config: %w", err)
+	}
+	if path.Clean(cfg.DefaultLogDir) != "/var/log/suricata" {
+		return fmt.Errorf("XDP verdict cache requires default-log-dir /var/log/suricata")
+	}
+	for _, output := range cfg.Outputs {
+		if eve, ok := output["eve-log"]; ok && eve.Enabled && (eve.Filetype == "" || eve.Filetype == "regular") && (eve.Filename == "" || eve.Filename == "eve.json") && !eve.Threaded {
+			return nil
+		}
+	}
+	return fmt.Errorf("XDP verdict cache requires enabled unthreaded regular eve-log at eve.json")
 }

@@ -185,14 +185,14 @@ func TestAPIServerCreateUpdateAndDisable(t *testing.T) {
 		t.Fatal("API server rejected or lost file extraction PVC")
 	}
 
-	inlineCM := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "inline-config", Namespace: "default"}, Data: map[string]string{"suricata.yaml": "af-packet:\n  - interface: ingress0\n    copy-mode: ips\n    copy-iface: egress0\n  - interface: egress0\n    copy-mode: ips\n    copy-iface: ingress0\n"}}
+	inlineCM := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "inline-config", Namespace: "default"}, Data: map[string]string{"suricata.yaml": "default-log-dir: /var/log/suricata\noutputs:\n  - eve-log:\n      enabled: true\n      filetype: regular\n      filename: eve.json\naf-packet:\n  - interface: ingress0\n    copy-mode: ips\n    copy-iface: egress0\n  - interface: egress0\n    copy-mode: ips\n    copy-iface: ingress0\n"}}
 	if err = c.Create(ctx, inlineCM); err != nil {
 		t.Fatal(err)
 	}
 	if err = c.Get(ctx, liveReq.NamespacedName, live); err != nil {
 		t.Fatal(err)
 	}
-	_ = unstructured.SetNestedField(live.Object, map[string]interface{}{"inlineInterfaces": []interface{}{"ingress0", "egress0"}, "hostNetwork": true}, "spec", "capture")
+	_ = unstructured.SetNestedField(live.Object, map[string]interface{}{"inlineInterfaces": []interface{}{"ingress0", "egress0"}, "hostNetwork": true, "xdpVerdictCache": map[string]interface{}{"image": "xdp:test", "ttlSeconds": int64(3)}}, "spec", "capture")
 	_ = unstructured.SetNestedField(live.Object, map[string]interface{}{"name": "inline-config", "key": "suricata.yaml"}, "spec", "configRef")
 	if err = c.Update(ctx, live); err != nil {
 		t.Fatal(err)
@@ -205,6 +205,9 @@ func TestAPIServerCreateUpdateAndDisable(t *testing.T) {
 	}
 	if len(ds.Spec.Template.Spec.Containers[0].Args) < 1 || ds.Spec.Template.Spec.Containers[0].Args[0] != "--af-packet" {
 		t.Fatal("inline mode not persisted")
+	}
+	if len(ds.Spec.Template.Spec.Containers) != 2 || ds.Spec.Template.Spec.Containers[1].Name != "xdp-verdict" {
+		t.Fatal("XDP verdict sidecar not persisted")
 	}
 
 }

@@ -95,6 +95,17 @@ spec:
                       type: string
                       minLength: 1
                       maxLength: 15
+                    xdpVerdictCache:
+                      type: object
+                      required: [image, ttlSeconds]
+                      properties:
+                        image:
+                          type: string
+                          minLength: 1
+                        ttlSeconds:
+                          type: integer
+                          minimum: 1
+                          maximum: 300
                     hostNetwork:
                       type: boolean
                       default: false

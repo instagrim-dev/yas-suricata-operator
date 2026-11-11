@@ -707,7 +707,7 @@ func TestInlineCanBeDisabledWithBrokenConfig(t *testing.T) {
 	s.SetNamespace("default")
 	s.SetUID(types.UID("uid"))
 	s.Object["spec"] = map[string]interface{}{"image": "i", "capture": map[string]interface{}{"inlineInterfaces": []interface{}{"eth1", "eth2"}, "hostNetwork": true}, "configRef": map[string]interface{}{"name": "cfg", "key": "suricata.yaml"}}
-	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cfg", Namespace: "default"}, Data: map[string]string{"suricata.yaml": "af-packet:\n - interface: eth1\n   copy-mode: ips\n   copy-iface: eth2\n - interface: eth2\n   copy-mode: ips\n   copy-iface: eth1\n"}}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cfg", Namespace: "default"}, Data: map[string]string{"suricata.yaml": "default-log-dir: /var/log/suricata\noutputs:\n - eve-log:\n     enabled: true\n     filetype: regular\n     filename: eve.json\naf-packet:\n - interface: eth1\n   copy-mode: ips\n   copy-iface: eth2\n - interface: eth2\n   copy-mode: ips\n   copy-iface: eth1\n"}}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(s, cm).Build()
 	r := &Reconciler{Client: c, Scheme: scheme}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "sensor", Namespace: "default"}}
@@ -728,5 +728,49 @@ func TestInlineCanBeDisabledWithBrokenConfig(t *testing.T) {
 	}
 	if err := c.Get(ctx, req.NamespacedName, &appsv1.DaemonSet{}); !apierrors.IsNotFound(err) {
 		t.Fatal("inline daemonset was not removed")
+	}
+}
+
+func TestXDPVerdictSidecarWiring(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = appsv1.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	scheme.AddKnownTypeWithName(SensorGVK, NewSensor())
+	s := NewSensor()
+	s.SetName("sensor")
+	s.SetNamespace("default")
+	s.SetUID(types.UID("uid"))
+	s.Object["spec"] = map[string]interface{}{"image": "i", "capture": map[string]interface{}{"inlineInterfaces": []interface{}{"eth1", "eth2"}, "hostNetwork": true, "xdpVerdictCache": map[string]interface{}{"image": "xdp:test", "ttlSeconds": int64(30)}}, "configRef": map[string]interface{}{"name": "cfg", "key": "suricata.yaml"}}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cfg", Namespace: "default"}, Data: map[string]string{"suricata.yaml": "default-log-dir: /var/log/suricata\noutputs:\n - eve-log:\n     enabled: true\n     filetype: regular\n     filename: eve.json\naf-packet:\n - interface: eth1\n   copy-mode: ips\n   copy-iface: eth2\n - interface: eth2\n   copy-mode: ips\n   copy-iface: eth1\n"}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(s, cm).Build()
+	r := &Reconciler{Client: c, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "sensor", Namespace: "default"}}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	ds := &appsv1.DaemonSet{}
+	if err := c.Get(ctx, req.NamespacedName, ds); err != nil {
+		t.Fatal(err)
+	}
+	pod := ds.Spec.Template.Spec
+	if len(pod.Containers) != 2 || pod.Containers[1].Name != "xdp-verdict" {
+		t.Fatal("missing verdict sidecar")
+	}
+	if pod.Containers[1].SecurityContext == nil || pod.Containers[1].SecurityContext.SeccompProfile == nil {
+		t.Fatal("missing BPF security context")
+	}
+	if len(pod.Containers[1].Args) == 0 || pod.Containers[1].Args[1] != "eth1" {
+		t.Fatal("wrong ingress interface")
+	}
+	shared := 0
+	for _, v := range pod.Volumes {
+		if v.Name == "eve-log" && v.EmptyDir != nil {
+			shared++
+		}
+	}
+	if shared != 1 {
+		t.Fatal("missing shared eve log")
 	}
 }

@@ -1,0 +1,55 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: suricatasensors.suricata.yas.ohbmo.com
+spec:
+  group: suricata.yas.ohbmo.com
+  scope: Namespaced
+  names:
+    plural: suricatasensors
+    singular: suricatasensor
+    kind: SuricataSensor
+    shortNames: [suri]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [image, capture]
+              properties:
+                image:
+                  type: string
+                  minLength: 1
+                disableChecksumValidation:
+                  type: boolean
+                  default: false
+                replicas:
+                  type: integer
+                  minimum: 0
+                  maximum: 1
+                  default: 1
+                capture:
+                  type: object
+                  required: [claimName, file]
+                  properties:
+                    claimName:
+                      type: string
+                      minLength: 1
+                    file:
+                      type: string
+                      minLength: 1
+                rules:
+                  type: object
+                  required: [claimName, updateSchedule]
+                  properties:
+                    claimName:
+                      type: string
+                      minLength: 1
+                    updateSchedule:
+                      type: string
+                      minLength: 1

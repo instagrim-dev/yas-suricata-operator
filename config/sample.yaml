@@ -1,0 +1,17 @@
+apiVersion: suricata.yas.ohbmo.com/v1alpha1
+kind: SuricataSensor
+metadata:
+  name: example
+  namespace: default
+spec:
+  # Replace with a compatible image available to your Kubernetes cluster.
+  image: example.invalid/suricata:replace-me
+  replicas: 1
+  capture:
+    # Existing PVC containing a directory of PCAP files.
+    claimName: packet-captures
+    file: incoming
+  # Optional: writable PVC plus an image containing suricata-update.
+  # rules:
+  #   claimName: suricata-rules
+  #   updateSchedule: '0 * * * *'

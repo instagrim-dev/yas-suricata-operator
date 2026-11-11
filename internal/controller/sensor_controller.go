@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path"
 	"strings"
@@ -17,6 +19,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 var SensorGVK = schema.GroupVersionKind{Group: "suricata.yas.ohbmo.com", Version: "v1alpha1", Kind: "SuricataSensor"}
@@ -61,6 +65,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if schedule != "" && rulesClaim == "" {
 		return ctrl.Result{}, fmt.Errorf("rules.claimName is required when rules.updateSchedule is set")
 	}
+	configName, configKey, configHash, err := r.configMapReference(ctx, s, "configRef")
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	rulesName, rulesKey, rulesHash, err := r.configMapReference(ctx, s, "rulesFileRef")
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	name := s.GetName()
 	namespace := s.GetNamespace()
 	labels := map[string]string{"app.kubernetes.io/name": "suricata", "app.kubernetes.io/instance": name}
@@ -89,6 +102,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 		engine.VolumeMounts = []corev1.VolumeMount{{Name: "capture", MountPath: "/capture"}}
 		pod.Volumes = []corev1.Volume{{Name: "capture", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim}}}}
+		if d.Spec.Template.Annotations == nil {
+			d.Spec.Template.Annotations = map[string]string{}
+		}
+		delete(d.Spec.Template.Annotations, "suricata.yas.ohbmo.com/config-sha256")
+		delete(d.Spec.Template.Annotations, "suricata.yas.ohbmo.com/rules-sha256")
+		if configName != "" {
+			d.Spec.Template.Annotations["suricata.yas.ohbmo.com/config-sha256"] = configHash
+			engine.Args = append(engine.Args, "-c", "/etc/suricata/operator/suricata.yaml")
+			engine.VolumeMounts = append(engine.VolumeMounts, corev1.VolumeMount{Name: "sensor-config", MountPath: "/etc/suricata/operator", ReadOnly: true})
+			pod.Volumes = append(pod.Volumes, corev1.Volume{Name: "sensor-config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: configName}, Items: []corev1.KeyToPath{{Key: configKey, Path: "suricata.yaml"}}}}})
+		}
+
+		if rulesName != "" {
+			d.Spec.Template.Annotations["suricata.yas.ohbmo.com/rules-sha256"] = rulesHash
+			engine.Args = append(engine.Args, "-s", "/etc/suricata/operator-rules/rules.rules")
+			engine.VolumeMounts = append(engine.VolumeMounts, corev1.VolumeMount{Name: "sensor-rule-file", MountPath: "/etc/suricata/operator-rules", ReadOnly: true})
+			pod.Volumes = append(pod.Volumes, corev1.Volume{Name: "sensor-rule-file", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: rulesName}, Items: []corev1.KeyToPath{{Key: rulesKey, Path: "rules.rules"}}}}})
+		}
 
 		if schedule != "" {
 			d.Spec.Template.Spec.Containers[0].VolumeMounts = append(d.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "rules", MountPath: "/var/lib/suricata/rules"})
@@ -141,5 +172,46 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 }
 func ptr[T any](v T) *T { return &v }
 func (r *Reconciler) Setup(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).For(NewSensor()).Owns(&appsv1.Deployment{}).Owns(&batchv1.CronJob{}).Complete(r)
+	return ctrl.NewControllerManagedBy(mgr).For(NewSensor()).Owns(&appsv1.Deployment{}).Owns(&batchv1.CronJob{}).Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.sensorsForConfigMap)).Complete(r)
+}
+
+// sensorsForConfigMap requeues only sensors in the same namespace referencing the changed configuration.
+func (r *Reconciler) sensorsForConfigMap(ctx context.Context, obj client.Object) []reconcile.Request {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(SensorGVK.GroupVersion().WithKind("SuricataSensorList"))
+	if err := r.List(ctx, list, client.InNamespace(obj.GetNamespace())); err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "unable to find sensors for changed ConfigMap", "namespace", obj.GetNamespace(), "name", obj.GetName())
+		return nil
+	}
+	requests := make([]reconcile.Request, 0)
+	for i := range list.Items {
+		sensor := &list.Items[i]
+		name, _, _ := unstructured.NestedString(sensor.Object, "spec", "configRef", "name")
+		rules, _, _ := unstructured.NestedString(sensor.Object, "spec", "rulesFileRef", "name")
+		if name == obj.GetName() || rules == obj.GetName() {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(sensor)})
+		}
+	}
+	return requests
+}
+
+func (r *Reconciler) configMapReference(ctx context.Context, sensor *unstructured.Unstructured, field string) (string, string, string, error) {
+	name, _, _ := unstructured.NestedString(sensor.Object, "spec", field, "name")
+	key, _, _ := unstructured.NestedString(sensor.Object, "spec", field, "key")
+	if (name == "") != (key == "") {
+		return "", "", "", fmt.Errorf("%s requires both name and key", field)
+	}
+	if name == "" {
+		return "", "", "", nil
+	}
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: sensor.GetNamespace(), Name: name}, cm); err != nil {
+		return "", "", "", fmt.Errorf("get %s: %w", field, err)
+	}
+	data, ok := cm.Data[key]
+	if !ok {
+		return "", "", "", fmt.Errorf("%s config map %q has no data key %q", field, name, key)
+	}
+	sum := sha256.Sum256([]byte(data))
+	return name, key, hex.EncodeToString(sum[:]), nil
 }

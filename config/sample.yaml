@@ -15,3 +15,10 @@ spec:
   # rules:
   #   claimName: suricata-rules
   #   updateSchedule: '0 * * * *'
+  # Optional: additive rules and engine configuration from same-namespace ConfigMaps.
+  # configRef:
+  #   name: engine-config
+  #   key: suricata.yaml
+  # rulesFileRef:
+  #   name: local-rules
+  #   key: custom.rules

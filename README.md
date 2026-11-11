@@ -10,6 +10,20 @@ A namespaced `SuricataSensor` creates one same-named Deployment. The operator mo
 
 Set `replicas: 0` to stop the engine and suspend the optional rule updater. Enabling `rules` creates a CronJob running `suricata-update` with an existing PVC mounted at `/var/lib/suricata/rules`. The running engine does **not** automatically reload updated rules; trigger a [rule reload](https://docs.suricata.io/en/suricata-7.0.14/rule-management/rule-reload.html) or restart it. Use a volume and scheduling configuration that permit the engine and updater to access the same rules store. The chosen engine image must contain `suricata`, its configuration, and, if rules updates are enabled, `suricata-update`.
 
+You may reference a same-namespace ConfigMap for engine configuration and an optional, additional rules file:
+
+```yaml
+spec:
+  configRef:
+    name: my-suricata-config
+    key: suricata.yaml
+  rulesFileRef:
+    name: my-custom-rules
+    key: custom.rules
+```
+
+The operator mounts the selected entries read-only, passes the config with `-c` and the additional rules with `-s`, and updates the Pod template when either entry changes. Kubernetes then replaces the Pod using the Deployment's Recreate strategy. ConfigMaps must exist and contain the selected keys; they are user-owned. The operator does not validate Suricata YAML or rule syntax. `-s` adds to rules in the engine configuration; do not duplicate signature IDs. Scheduled PVC rule updates still require a reload or restart separately.
+
 Suricata's image configuration controls where EVE output goes; this operator does not promise stdout logging. Checksum validation is left to the image configuration by default. To disable checksum checking for captures where offload makes it inappropriate, set `spec.disableChecksumValidation: true`.
 
 ## Try it
@@ -50,7 +64,7 @@ go vet ./...
 kubectl kustomize config
 ```
 
-Unit tests use a fake Kubernetes client. An additional API-server test runs when `KUBEBUILDER_ASSETS` points to matching `kube-apiserver`, `etcd`, and `kubectl` binaries; otherwise that test skips. The API-server test validates resource creation and repeated reconciliation, not packet capture, image compatibility or traffic analysis.
+Unit tests use a fake Kubernetes client. An additional API-server test runs when `KUBEBUILDER_ASSETS` points to matching `kube-apiserver`, `etcd`, and `kubectl` binaries; otherwise that test skips. The API-server tests validate resource creation, repeated reconciliation, and a running manager reacting to ConfigMap changes, not packet capture, image compatibility or traffic analysis.
 
 ## Design and limits
 

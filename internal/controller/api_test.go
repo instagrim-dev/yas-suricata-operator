@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -156,6 +157,25 @@ func TestAPIServerCreateUpdateAndDisable(t *testing.T) {
 		t.Fatalf("rules job still exists: %v", err)
 	}
 
+	live := NewSensor()
+	live.SetName("live")
+	live.SetNamespace("default")
+	live.Object["spec"] = map[string]interface{}{"image": "suricata:test", "capture": map[string]interface{}{"interface": "eth0", "hostNetwork": true, "nodeSelector": map[string]interface{}{"pool": "sensor"}}}
+	if err = c.Create(ctx, live); err != nil {
+		t.Fatal(err)
+	}
+	liveReq := ctrl.Request{NamespacedName: types.NamespacedName{Name: "live", Namespace: "default"}}
+	if _, err = r.Reconcile(ctx, liveReq); err != nil {
+		t.Fatal(err)
+	}
+	ds := &appsv1.DaemonSet{}
+	if err = c.Get(ctx, liveReq.NamespacedName, ds); err != nil {
+		t.Fatal(err)
+	}
+	if !ds.Spec.Template.Spec.HostNetwork || ds.Spec.Template.Spec.NodeSelector["pool"] != "sensor" || ds.Spec.Template.Spec.NodeSelector["kubernetes.io/os"] != "linux" {
+		t.Fatal("API server rejected or lost live capture settings")
+	}
+
 }
 
 // This exercises the real manager's ConfigMap watch, rather than calling Reconcile directly.
@@ -250,4 +270,68 @@ func TestManagerReactsToRulesConfigMapUpdate(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("manager did not roll deployment after rules ConfigMap update")
+}
+
+func TestAPIServerMetricsServiceMonitor(t *testing.T) {
+	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
+		t.Skip("set KUBEBUILDER_ASSETS to Kubernetes envtest binaries")
+	}
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config", "crd.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := yaml.YAMLToJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sensorCRD := &apiextv1.CustomResourceDefinition{}
+	if err = json.Unmarshal(data, sensorCRD); err != nil {
+		t.Fatal(err)
+	}
+	preserve := true
+	monitorCRD := &apiextv1.CustomResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "servicemonitors.monitoring.coreos.com"}, Spec: apiextv1.CustomResourceDefinitionSpec{Group: "monitoring.coreos.com", Scope: apiextv1.NamespaceScoped, Names: apiextv1.CustomResourceDefinitionNames{Plural: "servicemonitors", Singular: "servicemonitor", Kind: "ServiceMonitor"}, Versions: []apiextv1.CustomResourceDefinitionVersion{{Name: "v1", Served: true, Storage: true, Schema: &apiextv1.CustomResourceValidation{OpenAPIV3Schema: &apiextv1.JSONSchemaProps{Type: "object", XPreserveUnknownFields: &preserve}}}}}}
+	env := &envtest.Environment{CRDs: []*apiextv1.CustomResourceDefinition{sensorCRD, monitorCRD}}
+	cfg, err := env.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := env.Stop(); err != nil {
+			t.Error(err)
+		}
+	})
+	scheme := runtime.NewScheme()
+	_ = appsv1.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s := NewSensor()
+	s.SetName("monitored")
+	s.SetNamespace("default")
+	s.Object["spec"] = map[string]interface{}{"image": "suricata:test", "capture": map[string]interface{}{"claimName": "pcap", "file": "incoming"}, "metrics": map[string]interface{}{"exporterImage": "exporter:test", "port": int64(9100), "serviceMonitor": true}}
+	if err = c.Create(ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "monitored", Namespace: "default"}}
+	r := &Reconciler{Client: c, Scheme: scheme}
+	if _, err = r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Name: "monitored-metrics", Namespace: "default"}
+	svc := &corev1.Service{}
+	if err = c.Get(ctx, key, svc); err != nil {
+		t.Fatal(err)
+	}
+	if svc.Spec.Ports[0].Port != 9100 {
+		t.Fatal("port not persisted")
+	}
+	sm := &unstructured.Unstructured{}
+	sm.SetGroupVersionKind(schema.GroupVersionKind{Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor"})
+	if err = c.Get(ctx, key, sm); err != nil {
+		t.Fatal(err)
+	}
 }

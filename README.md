@@ -44,6 +44,26 @@ Optional `spec.resources.requests` and `spec.resources.limits` set standard Kube
 
 Suricata's image configuration controls where EVE output goes; this operator does not promise stdout logging. Checksum validation is left to the image configuration by default. To disable checksum checking for captures where offload makes it inappropriate, set `spec.disableChecksumValidation: true`.
 
+## Inline AF_PACKET IPS
+
+Inline IPS is an explicit alternative to passive capture. Supply two dedicated interfaces on selected Linux nodes, `hostNetwork: true`, and a `configRef` for a complete Suricata YAML file. The YAML must declare symmetric `af-packet` entries: each interface uses `copy-mode: ips` and names the other as `copy-iface`. For example:
+
+```yaml
+spec:
+  capture:
+    inlineInterfaces: [ingress0, egress0]
+    hostNetwork: true
+    nodeSelector:
+      capture: inline-ips
+  configRef:
+    name: suricata-inline-config
+    key: suricata.yaml
+```
+
+The controller validates that interface pair in the referenced YAML and starts the DaemonSet with `--af-packet --runmode workers`. Supply Suricata rules containing the intended `drop` actions through the Suricata configuration or `rulesFileRef`/`rulesFileRefs`. Configure the node network so the dedicated interfaces really carry the intended traffic. Apply a node selector suitable for your topology; without one, the DaemonSet targets all Linux nodes. The image must support AF_PACKET IPS and the cluster must permit NET_RAW and NET_ADMIN.
+
+**Inline mode changes the forwarding path and may interrupt traffic**, including when configuration, interfaces, rules, the process, a pod, or a node fail. This operator does not install an automatic hardware bypass or fail-safe path. The controller checks the paired interfaces and IPS copy mode when reconciling; it does not validate the complete Suricata configuration, rules, or network topology. Test on an isolated link before any production use. This feature uses Suricata's native AF_PACKET IPS; it does not implement eBPF/XDP enforcement. See [bounded verification](docs/live-verification.md).
+
 ## File extraction storage
 
 Suricata file extraction is enabled through the Suricata YAML supplied via `configRef`; the operator does not enable the file-store output or select which traffic to store. To provide persistent writable storage for it, set:

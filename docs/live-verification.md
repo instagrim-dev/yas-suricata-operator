@@ -8,4 +8,6 @@ For file extraction, the operator mounted an existing writable PVC into a Deploy
 
 The configuration-backup utility also exported and restored a test sensor using the disposable cluster. That operation covers sensor spec and referenced ConfigMaps, not PVC contents or Secrets.
 
-This exercise does not establish inline IPS/eBPF packet-drop enforcement, production traffic capture, automatic rule reload, distributed operation, actual metrics exporter output, or performance. Synthetic test artifacts and logs were retained locally under `/tmp/yas-live`; no production capture is included in this repository.
+A separate disposable kind cluster exercised opt-in native Suricata 8.0.8 AF_PACKET inline IPS. The operator created a host-network DaemonSet with two dedicated veth interfaces and symmetric `copy-mode: ips` configuration. Two isolated network namespaces sent `ALLOWME` and `BLOCKME` UDP payloads through that pair: the receiver obtained only `ALLOWME`, and EVE recorded signature 9000401 as `blocked`. The traffic and interfaces were confined to the disposable kind node; the sender disabled UDP checksums for the synthetic veth fixture. This establishes that particular configured path, not an automatic bypass or fail-safe.
+
+The exercises do not establish eBPF/XDP packet-drop enforcement, production traffic capture, automatic rule reload, distributed operation, actual metrics exporter output, or performance. Synthetic test artifacts and logs were retained locally under `/tmp/yas-live`; no production capture is included in this repository.

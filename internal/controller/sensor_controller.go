@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/yaml"
 )
 
 var SensorGVK = schema.GroupVersionKind{Group: "suricata.yas.ohbmo.com", Version: "v1alpha1", Kind: "SuricataSensor"}
@@ -48,16 +49,38 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	claim, _, _ := unstructured.NestedString(s.Object, "spec", "capture", "claimName")
 	file, _, _ := unstructured.NestedString(s.Object, "spec", "capture", "file")
 	iface, _, _ := unstructured.NestedString(s.Object, "spec", "capture", "interface")
-	hostNetwork, _, _ := unstructured.NestedBool(s.Object, "spec", "capture", "hostNetwork")
-	if image == "" || (iface == "" && (claim == "" || file == "")) || (iface != "" && (claim != "" || file != "")) {
-		return ctrl.Result{}, fmt.Errorf("image and exactly one capture mode are required: interface or claimName/file")
+	inlineInterfaces, _, err := unstructured.NestedStringSlice(s.Object, "spec", "capture", "inlineInterfaces")
+	if err != nil {
+		return ctrl.Result{}, err
 	}
-	if iface != "" && (len(iface) > 15 || strings.ContainsAny(iface, " /\t\n")) {
+	hostNetwork, _, _ := unstructured.NestedBool(s.Object, "spec", "capture", "hostNetwork")
+	modes := 0
+	if iface != "" {
+		modes++
+	}
+	if len(inlineInterfaces) > 0 {
+		modes++
+	}
+	if claim != "" || file != "" {
+		modes++
+		if claim == "" || file == "" {
+			return ctrl.Result{}, fmt.Errorf("capture.claimName and capture.file must both be set")
+		}
+	}
+	if image == "" || modes != 1 {
+		return ctrl.Result{}, fmt.Errorf("image and exactly one capture mode required: interface, inlineInterfaces, or claimName/file")
+	}
+	if iface != "" && !validInterface(iface) {
 		return ctrl.Result{}, fmt.Errorf("invalid capture interface")
 	}
-	if iface == "" && (strings.HasPrefix(file, "/") || path.Clean(file) != file || file == ".." || strings.HasPrefix(file, "../")) {
+	if len(inlineInterfaces) > 0 && (len(inlineInterfaces) != 2 || !hostNetwork || inlineInterfaces[0] == inlineInterfaces[1] || !validInterface(inlineInterfaces[0]) || !validInterface(inlineInterfaces[1])) {
+		return ctrl.Result{}, fmt.Errorf("inline IPS requires two distinct valid interfaces and hostNetwork")
+	}
+	liveMode := iface != "" || len(inlineInterfaces) > 0
+	if !liveMode && (strings.HasPrefix(file, "/") || path.Clean(file) != file || file == ".." || strings.HasPrefix(file, "../")) {
 		return ctrl.Result{}, fmt.Errorf("capture.file must be a clean relative path")
 	}
+
 	replicas, found, err := unstructured.NestedInt64(s.Object, "spec", "replicas")
 	if err != nil {
 		return ctrl.Result{}, err
@@ -68,6 +91,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if replicas < 0 || replicas > 1 {
 		return ctrl.Result{}, fmt.Errorf("replicas must be 0 or 1")
 	}
+	// Stop live packet forwarding even when referenced configuration has gone missing.
+	if liveMode && replicas == 0 {
+		for _, obj := range []client.Object{&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: s.GetName(), Namespace: s.GetNamespace()}}, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: s.GetName(), Namespace: s.GetNamespace()}}} {
+			if err := removeOwned(ctx, r.Client, s, obj); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		job := &batchv1.CronJob{}
+		err := r.Get(ctx, client.ObjectKey{Name: s.GetName() + "-rules", Namespace: s.GetNamespace()}, job)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+		if err == nil && metav1.IsControlledBy(job, s) && (job.Spec.Suspend == nil || !*job.Spec.Suspend) {
+			job.Spec.Suspend = ptr(true)
+			if err := r.Update(ctx, job); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
 	schedule, _, _ := unstructured.NestedString(s.Object, "spec", "rules", "updateSchedule")
 	rulesClaim, _, _ := unstructured.NestedString(s.Object, "spec", "rules", "claimName")
 	if schedule != "" && rulesClaim == "" {
@@ -76,6 +119,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	configName, configKey, configHash, err := r.configMapReference(ctx, s, "configRef")
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if len(inlineInterfaces) > 0 {
+		if configName == "" {
+			return ctrl.Result{}, fmt.Errorf("inline IPS requires configRef with symmetric af-packet IPS configuration")
+		}
+		cm := &corev1.ConfigMap{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: s.GetNamespace(), Name: configName}, cm); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := validateInlineConfig(cm.Data[configKey], inlineInterfaces); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	fileClaim, _, _ := unstructured.NestedString(s.Object, "spec", "fileExtraction", "claimName")
 	filePath, _, _ := unstructured.NestedString(s.Object, "spec", "fileExtraction", "mountPath")
@@ -152,8 +207,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			}
 		}
 		engine.Command = []string{"suricata"}
-		if iface == "" {
+		if !liveMode {
 			engine.Args = []string{"-r", "/capture/" + file, "--pcap-file-continuous"}
+		} else if len(inlineInterfaces) > 0 {
+			engine.Args = []string{"--af-packet", "--runmode", "workers"}
 		} else {
 			engine.Args = []string{"-i", iface}
 		}
@@ -162,7 +219,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			engine.Args = append(engine.Args, "-k", "none")
 		}
 		pod.NodeSelector = nil
-		if iface != "" {
+		if liveMode {
 			selector, _, err := unstructured.NestedStringMap(s.Object, "spec", "capture", "nodeSelector")
 			if err != nil {
 				return err
@@ -176,12 +233,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			selector["kubernetes.io/os"] = "linux"
 			pod.NodeSelector = selector
 		}
-		pod.HostNetwork = iface != "" && hostNetwork
+		pod.HostNetwork = liveMode && hostNetwork
 		pod.DNSPolicy = corev1.DNSClusterFirst
 		engine.SecurityContext = nil
 		engine.VolumeMounts = nil
 		pod.Volumes = nil
-		if iface == "" {
+		if !liveMode {
 			engine.VolumeMounts = []corev1.VolumeMount{{Name: "capture", MountPath: "/capture"}}
 			pod.Volumes = []corev1.Volume{{Name: "capture", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim}}}}
 		} else {
@@ -240,7 +297,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 		return nil
 	}
-	if iface == "" {
+	if !liveMode {
 		_, err = controllerutil.CreateOrUpdate(ctx, r.Client, d, render)
 		if err == nil {
 			err = removeOwned(ctx, r.Client, s, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
@@ -494,4 +551,39 @@ func (r *Reconciler) reconcileMetrics(ctx context.Context, sensor *unstructured.
 		return fmt.Errorf("ServiceMonitor requested but its CRD is not installed: %w", err)
 	}
 	return err
+}
+
+func validInterface(v string) bool {
+	return v != "" && len(v) <= 15 && !strings.ContainsAny(v, " /\t\n")
+}
+func validateInlineConfig(content string, interfaces []string) error {
+	var cfg struct {
+		AFPackets []struct {
+			Interface string `json:"interface"`
+			CopyMode  string `json:"copy-mode"`
+			CopyIface string `json:"copy-iface"`
+		} `json:"af-packet"`
+	}
+	if err := yaml.Unmarshal([]byte(content), &cfg); err != nil {
+		return fmt.Errorf("invalid inline Suricata config: %w", err)
+	}
+	expected := map[string]string{interfaces[0]: interfaces[1], interfaces[1]: interfaces[0]}
+	seen := map[string]bool{}
+	for _, entry := range cfg.AFPackets {
+		peer, ok := expected[entry.Interface]
+		if !ok {
+			if entry.Interface != "default" {
+				return fmt.Errorf("unexpected AF_PACKET interface %q", entry.Interface)
+			}
+			continue
+		}
+		if seen[entry.Interface] || entry.CopyMode != "ips" || entry.CopyIface != peer {
+			return fmt.Errorf("inline AF_PACKET configuration must pair %s and %s with copy-mode ips", interfaces[0], interfaces[1])
+		}
+		seen[entry.Interface] = true
+	}
+	if len(seen) != 2 {
+		return fmt.Errorf("inline AF_PACKET configuration missing required symmetric interfaces")
+	}
+	return nil
 }

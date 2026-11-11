@@ -185,6 +185,28 @@ func TestAPIServerCreateUpdateAndDisable(t *testing.T) {
 		t.Fatal("API server rejected or lost file extraction PVC")
 	}
 
+	inlineCM := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "inline-config", Namespace: "default"}, Data: map[string]string{"suricata.yaml": "af-packet:\n  - interface: ingress0\n    copy-mode: ips\n    copy-iface: egress0\n  - interface: egress0\n    copy-mode: ips\n    copy-iface: ingress0\n"}}
+	if err = c.Create(ctx, inlineCM); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.Get(ctx, liveReq.NamespacedName, live); err != nil {
+		t.Fatal(err)
+	}
+	_ = unstructured.SetNestedField(live.Object, map[string]interface{}{"inlineInterfaces": []interface{}{"ingress0", "egress0"}, "hostNetwork": true}, "spec", "capture")
+	_ = unstructured.SetNestedField(live.Object, map[string]interface{}{"name": "inline-config", "key": "suricata.yaml"}, "spec", "configRef")
+	if err = c.Update(ctx, live); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = r.Reconcile(ctx, liveReq); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.Get(ctx, liveReq.NamespacedName, ds); err != nil {
+		t.Fatal(err)
+	}
+	if len(ds.Spec.Template.Spec.Containers[0].Args) < 1 || ds.Spec.Template.Spec.Containers[0].Args[0] != "--af-packet" {
+		t.Fatal("inline mode not persisted")
+	}
+
 }
 
 // This exercises the real manager's ConfigMap watch, rather than calling Reconcile directly.

@@ -653,3 +653,80 @@ func TestFileExtractionRejectsUnsafeMountPath(t *testing.T) {
 		})
 	}
 }
+
+func TestInlineAFPacketRequiresSymmetricConfig(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = appsv1.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	scheme.AddKnownTypeWithName(SensorGVK, NewSensor())
+	s := NewSensor()
+	s.SetName("sensor")
+	s.SetNamespace("default")
+	s.SetUID(types.UID("uid"))
+	s.Object["spec"] = map[string]interface{}{"image": "i", "capture": map[string]interface{}{"inlineInterfaces": []interface{}{"eth1", "eth2"}, "hostNetwork": true}, "configRef": map[string]interface{}{"name": "cfg", "key": "suricata.yaml"}}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cfg", Namespace: "default"}, Data: map[string]string{"suricata.yaml": "af-packet:\n  - interface: eth1\n    copy-mode: ips\n    copy-iface: eth2\n  - interface: eth2\n    copy-mode: ips\n    copy-iface: eth1\n"}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(s, cm).Build()
+	r := &Reconciler{Client: c, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "sensor", Namespace: "default"}}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	ds := &appsv1.DaemonSet{}
+	if err := c.Get(ctx, req.NamespacedName, ds); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, a := range ds.Spec.Template.Spec.Containers[0].Args {
+		if a == "--af-packet" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("inline capture mode missing")
+	}
+	cm.Data["suricata.yaml"] = "af-packet:\n  - interface: eth1\n    copy-mode: tap\n    copy-iface: eth2\n"
+	if err := c.Update(ctx, cm); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, req); err == nil {
+		t.Fatal("asymmetric non-IPS config accepted")
+	}
+}
+
+func TestInlineCanBeDisabledWithBrokenConfig(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = appsv1.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	scheme.AddKnownTypeWithName(SensorGVK, NewSensor())
+	s := NewSensor()
+	s.SetName("sensor")
+	s.SetNamespace("default")
+	s.SetUID(types.UID("uid"))
+	s.Object["spec"] = map[string]interface{}{"image": "i", "capture": map[string]interface{}{"inlineInterfaces": []interface{}{"eth1", "eth2"}, "hostNetwork": true}, "configRef": map[string]interface{}{"name": "cfg", "key": "suricata.yaml"}}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cfg", Namespace: "default"}, Data: map[string]string{"suricata.yaml": "af-packet:\n - interface: eth1\n   copy-mode: ips\n   copy-iface: eth2\n - interface: eth2\n   copy-mode: ips\n   copy-iface: eth1\n"}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(s, cm).Build()
+	r := &Reconciler{Client: c, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "sensor", Namespace: "default"}}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(ctx, cm); err != nil {
+		t.Fatal(err)
+	}
+	current := NewSensor()
+	_ = c.Get(ctx, req.NamespacedName, current)
+	_ = unstructured.SetNestedField(current.Object, int64(0), "spec", "replicas")
+	if err := c.Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("cannot disable inline with missing config: %v", err)
+	}
+	if err := c.Get(ctx, req.NamespacedName, &appsv1.DaemonSet{}); !apierrors.IsNotFound(err) {
+		t.Fatal("inline daemonset was not removed")
+	}
+}

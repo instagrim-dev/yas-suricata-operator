@@ -81,7 +81,16 @@ spec:
                   oneOf:
                     - required: [claimName, file]
                     - required: [interface]
+                    - required: [inlineInterfaces]
                   properties:
+                    inlineInterfaces:
+                      type: array
+                      minItems: 2
+                      maxItems: 2
+                      items:
+                        type: string
+                        minLength: 1
+                        maxLength: 15
                     interface:
                       type: string
                       minLength: 1

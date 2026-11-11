@@ -2,7 +2,7 @@
 
 A Kubernetes controller for Suricata packet-capture workloads, supporting offline PCAP files and live capture from network interfaces. It is a standalone project informed by YAS's Suricata orchestration; it does not require the YAS monolith, Zeek, or a Corelight deployment.
 
-This is an early implementation. It creates and updates Kubernetes resources; it has **not yet been demonstrated processing packets in a live cluster**. No operator container image has been published for this project.
+This is an early implementation. It has processed synthetic capture and live traffic in a disposable Kubernetes cluster; see the verification record for scope. No operator container image has been published for this project.
 
 ## What it does
 
@@ -43,6 +43,19 @@ The operator mounts the selected entries read-only, passes the config with `-c` 
 Optional `spec.resources.requests` and `spec.resources.limits` set standard Kubernetes CPU and memory quantities for the engine container in either capture mode.
 
 Suricata's image configuration controls where EVE output goes; this operator does not promise stdout logging. Checksum validation is left to the image configuration by default. To disable checksum checking for captures where offload makes it inappropriate, set `spec.disableChecksumValidation: true`.
+
+## File extraction storage
+
+Suricata file extraction is enabled through the Suricata YAML supplied via `configRef`; the operator does not enable the file-store output or select which traffic to store. To provide persistent writable storage for it, set:
+
+```yaml
+spec:
+  fileExtraction:
+    claimName: extracted-files
+    mountPath: /var/log/suricata/filestore
+```
+
+Set Suricata's `file-store.dir` to the same mount path, enable its `file-store` output, and configure a `filestore` rule or Suricata's force-filestore option. The PVC must already exist in the sensor namespace and support the scheduling/access pattern of the Deployment or DaemonSet. The operator mounts it read/write, but never creates or deletes the claim. Omitting `fileExtraction` removes the mount; it does not erase stored files. The configuration backup covers the sensor and referenced configuration, not the PVC contents.
 
 ## Metrics integration
 
@@ -89,6 +102,8 @@ Requirements: Go 1.21+, Docker (or another image builder), `kubectl`, a Kubernet
    ```
 
 The image name in `config/operator.yaml` is a local build placeholder, not a published image. Review the Suricata image's startup requirements and configuration. EVE logs may be written to a file instead of the container log; check that image's configuration.
+
+See [live verification](docs/live-verification.md) for the bounded Kubernetes and synthetic traffic tests.
 
 ## Development and tests
 

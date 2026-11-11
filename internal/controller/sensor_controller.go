@@ -77,6 +77,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	fileClaim, _, _ := unstructured.NestedString(s.Object, "spec", "fileExtraction", "claimName")
+	filePath, _, _ := unstructured.NestedString(s.Object, "spec", "fileExtraction", "mountPath")
+	if (fileClaim == "") != (filePath == "") {
+		return ctrl.Result{}, fmt.Errorf("fileExtraction requires claimName and mountPath")
+	}
+	if filePath != "" {
+		if !strings.HasPrefix(filePath, "/") || filePath == "/" || path.Clean(filePath) != filePath {
+			return ctrl.Result{}, fmt.Errorf("fileExtraction.mountPath must be a clean absolute non-root path")
+		}
+		for _, reserved := range []string{"/capture", "/etc/suricata/operator", "/etc/suricata/operator-rules", "/var/lib/suricata/rules"} {
+			if filePath == reserved || strings.HasPrefix(filePath, reserved+"/") || strings.HasPrefix(reserved, filePath+"/") {
+				return ctrl.Result{}, fmt.Errorf("fileExtraction.mountPath overlaps a managed mount")
+			}
+		}
+	}
 	metricsImage, _, _ := unstructured.NestedString(s.Object, "spec", "metrics", "exporterImage")
 	metricsPort, metricsFound, metricsErr := unstructured.NestedInt64(s.Object, "spec", "metrics", "port")
 	if metricsErr != nil {
@@ -212,6 +227,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			pod.Volumes = append(pod.Volumes, corev1.Volume{Name: "sensor-rule-file", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: projections}}})
 		}
 
+		if fileClaim != "" {
+			engine.VolumeMounts = append(engine.VolumeMounts, corev1.VolumeMount{Name: "filestore", MountPath: filePath})
+			pod.Volumes = append(pod.Volumes, corev1.Volume{Name: "filestore", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: fileClaim}}})
+		}
 		if metricsImage != "" {
 			pod.Containers = append(pod.Containers, corev1.Container{Name: "metrics-exporter", Image: metricsImage, Args: metricsArgs, Ports: []corev1.ContainerPort{{Name: "metrics", ContainerPort: int32(metricsPort)}}})
 		}

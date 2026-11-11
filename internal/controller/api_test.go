@@ -160,7 +160,7 @@ func TestAPIServerCreateUpdateAndDisable(t *testing.T) {
 	live := NewSensor()
 	live.SetName("live")
 	live.SetNamespace("default")
-	live.Object["spec"] = map[string]interface{}{"image": "suricata:test", "capture": map[string]interface{}{"interface": "eth0", "hostNetwork": true, "nodeSelector": map[string]interface{}{"pool": "sensor"}}}
+	live.Object["spec"] = map[string]interface{}{"image": "suricata:test", "capture": map[string]interface{}{"interface": "eth0", "hostNetwork": true, "nodeSelector": map[string]interface{}{"pool": "sensor"}}, "fileExtraction": map[string]interface{}{"claimName": "files", "mountPath": "/var/log/suricata/filestore"}}
 	if err = c.Create(ctx, live); err != nil {
 		t.Fatal(err)
 	}
@@ -174,6 +174,15 @@ func TestAPIServerCreateUpdateAndDisable(t *testing.T) {
 	}
 	if !ds.Spec.Template.Spec.HostNetwork || ds.Spec.Template.Spec.NodeSelector["pool"] != "sensor" || ds.Spec.Template.Spec.NodeSelector["kubernetes.io/os"] != "linux" {
 		t.Fatal("API server rejected or lost live capture settings")
+	}
+	fileVolume := false
+	for _, v := range ds.Spec.Template.Spec.Volumes {
+		if v.Name == "filestore" && v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == "files" {
+			fileVolume = true
+		}
+	}
+	if !fileVolume {
+		t.Fatal("API server rejected or lost file extraction PVC")
 	}
 
 }

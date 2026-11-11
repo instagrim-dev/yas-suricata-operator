@@ -580,3 +580,76 @@ func TestMetricsServiceAndMonitorLifecycle(t *testing.T) {
 		t.Fatal("metrics sidecar retained")
 	}
 }
+
+func TestFileExtractionMountLifecycle(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = appsv1.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	scheme.AddKnownTypeWithName(SensorGVK, NewSensor())
+	s := NewSensor()
+	s.SetName("sensor")
+	s.SetNamespace("default")
+	s.SetUID(types.UID("uid"))
+	s.Object["spec"] = map[string]interface{}{"image": "i", "capture": map[string]interface{}{"claimName": "c", "file": "in"}, "fileExtraction": map[string]interface{}{"claimName": "files", "mountPath": "/var/log/suricata/filestore"}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(s).Build()
+	r := &Reconciler{Client: c, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "sensor", Namespace: "default"}}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	d := &appsv1.Deployment{}
+	if err := c.Get(ctx, req.NamespacedName, d); err != nil {
+		t.Fatal(err)
+	}
+	var foundMount, foundVolume bool
+	for _, m := range d.Spec.Template.Spec.Containers[0].VolumeMounts {
+		if m.Name == "filestore" && m.MountPath == "/var/log/suricata/filestore" && !m.ReadOnly {
+			foundMount = true
+		}
+	}
+	for _, v := range d.Spec.Template.Spec.Volumes {
+		if v.Name == "filestore" && v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == "files" {
+			foundVolume = true
+		}
+	}
+	if !foundMount || !foundVolume {
+		t.Fatal("file store PVC not mounted")
+	}
+	current := NewSensor()
+	_ = c.Get(ctx, req.NamespacedName, current)
+	unstructured.RemoveNestedField(current.Object, "spec", "fileExtraction")
+	if err := c.Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Get(ctx, req.NamespacedName, d)
+	for _, v := range d.Spec.Template.Spec.Volumes {
+		if v.Name == "filestore" {
+			t.Fatal("removed file store still mounted")
+		}
+	}
+}
+func TestFileExtractionRejectsUnsafeMountPath(t *testing.T) {
+	for _, p := range []string{"/", "relative", "/capture", "/capture/inside", "/etc/suricata/operator/subdir", "/a/../b"} {
+		t.Run(p, func(t *testing.T) {
+			ctx := context.Background()
+			scheme := runtime.NewScheme()
+			_ = appsv1.AddToScheme(scheme)
+			_ = corev1.AddToScheme(scheme)
+			scheme.AddKnownTypeWithName(SensorGVK, NewSensor())
+			s := NewSensor()
+			s.SetName("sensor")
+			s.SetNamespace("default")
+			s.Object["spec"] = map[string]interface{}{"image": "i", "capture": map[string]interface{}{"claimName": "c", "file": "in"}, "fileExtraction": map[string]interface{}{"claimName": "files", "mountPath": p}}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(s).Build()
+			_, err := (&Reconciler{Client: c, Scheme: scheme}).Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "sensor", Namespace: "default"}})
+			if err == nil {
+				t.Fatal("unsafe mount path accepted")
+			}
+		})
+	}
+}

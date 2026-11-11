@@ -25,6 +25,17 @@ spec:
                 image:
                   type: string
                   minLength: 1
+                fileExtraction:
+                  type: object
+                  required: [claimName, mountPath]
+                  properties:
+                    claimName:
+                      type: string
+                      minLength: 1
+                    mountPath:
+                      type: string
+                      minLength: 2
+                      pattern: '^/'
                 metrics:
                   type: object
                   required: [exporterImage, port]
